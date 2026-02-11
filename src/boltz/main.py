@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import pickle
 import platform
+import csv
 import tarfile
 import urllib.request
 import warnings
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import click
+import numpy as np
 import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
@@ -27,8 +29,10 @@ from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.csv import parse_csv
 from boltz.data.parse.fasta import parse_fasta
+from boltz.data.parse.mmcif import parse_mmcif
+from boltz.data.parse.pdb import parse_pdb
 from boltz.data.parse.yaml import parse_yaml
-from boltz.data.types import MSA, Manifest, Record
+from boltz.data.types import ChainInfo, InterfaceInfo, MSA, Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
 from boltz.model.models.boltz2 import Boltz2
@@ -812,6 +816,297 @@ def process_inputs(
 def cli() -> None:
     """Boltz."""
     return
+
+
+def _collect_structure_paths(data: Path) -> list[Path]:
+    """Collect structure files from an input path."""
+    supported = {".pdb", ".cif", ".mmcif"}
+    if data.is_file():
+        if data.suffix.lower() not in supported:
+            msg = f"Unsupported input file suffix: {data.suffix}."
+            raise ValueError(msg)
+        return [data]
+
+    if data.is_dir():
+        files = [
+            path
+            for path in sorted(data.iterdir())
+            if path.is_file() and path.suffix.lower() in supported
+        ]
+        if not files:
+            msg = f"No .pdb/.cif/.mmcif files found in {data}."
+            raise ValueError(msg)
+        return files
+
+    msg = f"Input path {data} does not exist."
+    raise ValueError(msg)
+
+
+def _build_record_from_structure(path: Path, structure) -> tuple[Record, object]:
+    """Build a Boltz record from parsed structure data."""
+    struct = structure.data
+    chains = [
+        ChainInfo(
+            chain_id=int(chain["asym_id"]),
+            chain_name=str(chain["name"]),
+            mol_type=int(chain["mol_type"]),
+            cluster_id=int(chain["entity_id"]),
+            msa_id=-1,
+            num_residues=int(chain["res_num"]),
+            valid=True,
+            entity_id=int(chain["entity_id"]),
+        )
+        for chain in struct.chains
+    ]
+    interfaces = [
+        InterfaceInfo(chain_1=int(interface["chain_1"]), chain_2=int(interface["chain_2"]))
+        for interface in struct.interfaces
+    ]
+    record = Record(
+        id=path.stem,
+        structure=structure.info,
+        chains=chains,
+        interfaces=interfaces,
+    )
+    return record, struct
+
+
+def _compute_ipsae(pae: torch.Tensor, asym_id: torch.Tensor, token_mask: torch.Tensor) -> dict:
+    """Compute a simple interface-pAE score from PAE outputs."""
+    pae_np = pae.detach().cpu().numpy()
+    asym_np = asym_id.detach().cpu().numpy()
+    mask_np = token_mask.detach().cpu().numpy().astype(bool)
+
+    valid = np.outer(mask_np, mask_np)
+    inter = (asym_np[:, None] != asym_np[None, :]) & valid
+    pair_scores = 1.0 / (1.0 + (pae_np / 10.0) ** 2)
+    ipsae = float(pair_scores[inter].mean()) if inter.any() else 0.0
+
+    per_pair = {}
+    chain_ids = sorted(np.unique(asym_np[mask_np]).tolist())
+    for chain_i in chain_ids:
+        per_pair[str(chain_i)] = {}
+        for chain_j in chain_ids:
+            if chain_i == chain_j:
+                continue
+            pair_mask = (
+                (asym_np[:, None] == chain_i)
+                & (asym_np[None, :] == chain_j)
+                & valid
+            )
+            per_pair[str(chain_i)][str(chain_j)] = (
+                float(pair_scores[pair_mask].mean()) if pair_mask.any() else 0.0
+            )
+
+    return {"ipSAE": ipsae, "pair_chain_ipSAE": per_pair}
+
+
+@cli.command()
+@click.argument("data", type=click.Path(exists=True))
+@click.option(
+    "--out_dir",
+    type=click.Path(exists=False),
+    default="./",
+    help="The path where to save score-only confidence outputs.",
+)
+@click.option(
+    "--cache",
+    type=click.Path(exists=False),
+    default=get_cache_path,
+    help=(
+        "The directory where to download data and model. "
+        "Default is ~/.boltz, or $BOLTZ_CACHE if set."
+    ),
+)
+@click.option(
+    "--checkpoint",
+    type=click.Path(exists=True),
+    default=None,
+    help="Optional Boltz-2 checkpoint path. Defaults to boltz2_conf.ckpt.",
+)
+@click.option(
+    "--accelerator",
+    type=click.Choice(["gpu", "cpu"]),
+    default="gpu",
+    help="Device backend for inference. Default is gpu.",
+)
+@click.option(
+    "--recycling_steps",
+    type=int,
+    default=3,
+    help="The number of recycling steps to use. Default is 3.",
+)
+@click.option(
+    "--num_workers",
+    type=int,
+    default=2,
+    help="The number of dataloader workers to use. Default is 2.",
+)
+@torch.inference_mode()
+def score(
+    data: str,
+    out_dir: str,
+    cache: str,
+    checkpoint: Optional[str],
+    accelerator: str,
+    recycling_steps: int,
+    num_workers: int,
+) -> None:
+    """Score existing PDB/CIF structures with confidence head only (no diffusion)."""
+    if accelerator == "gpu" and not torch.cuda.is_available():
+        click.echo("No GPU detected, falling back to CPU.")
+        accelerator = "cpu"
+
+    cache = Path(cache)
+    out_dir = Path(out_dir)
+    data_path = Path(data)
+
+    download_boltz2(cache)
+    mol_dir = cache / "mols"
+
+    files = _collect_structure_paths(data_path)
+    processed_targets = out_dir / "processed_score" / "structures"
+    processed_records = out_dir / "processed_score" / "records"
+    processed_msa = out_dir / "processed_score" / "msa"
+    processed_targets.mkdir(parents=True, exist_ok=True)
+    processed_records.mkdir(parents=True, exist_ok=True)
+    processed_msa.mkdir(parents=True, exist_ok=True)
+
+    records = []
+    for path in tqdm(files, desc="Parsing structures"):
+        if path.suffix.lower() == ".pdb":
+            parsed = parse_pdb(str(path), moldir=str(mol_dir), use_assembly=False)
+        else:
+            parsed = parse_mmcif(str(path), moldir=str(mol_dir), use_assembly=False)
+
+        record, struct = _build_record_from_structure(path, parsed)
+        struct.dump(processed_targets / f"{record.id}.npz")
+        record.dump(processed_records / f"{record.id}.json")
+        records.append(record)
+
+    manifest = Manifest(records=records)
+    manifest.dump(out_dir / "processed_score" / "manifest.json")
+
+    data_module = Boltz2InferenceDataModule(
+        manifest=manifest,
+        target_dir=processed_targets,
+        msa_dir=processed_msa,
+        mol_dir=mol_dir,
+        num_workers=num_workers,
+    )
+    data_module.setup(stage="predict")
+    dataloader = data_module.predict_dataloader()
+
+    if checkpoint is None:
+        checkpoint = cache / "boltz2_conf.ckpt"
+    else:
+        checkpoint = Path(checkpoint)
+
+    model_module = Boltz2.load_from_checkpoint(
+        checkpoint,
+        strict=True,
+        predict_args={
+            "recycling_steps": recycling_steps,
+            "sampling_steps": 1,
+            "diffusion_samples": 1,
+            "max_parallel_samples": 1,
+            "write_confidence_summary": True,
+            "write_full_pae": False,
+            "write_full_pde": False,
+        },
+        map_location="cpu",
+        ema=False,
+        skip_run_structure=True,
+    )
+    model_module.eval()
+    device = torch.device("cuda" if accelerator == "gpu" else "cpu")
+    model_module = model_module.to(device)
+
+    full_results = []
+    summary_results = []
+    for batch in tqdm(dataloader, desc="Scoring"):
+        batch = {
+            k: (v.to(device) if torch.is_tensor(v) else v)
+            for k, v in batch.items()
+        }
+        out = model_module(
+            batch,
+            recycling_steps=recycling_steps,
+            num_sampling_steps=1,
+            diffusion_samples=1,
+            max_parallel_samples=1,
+            run_confidence_sequentially=True,
+        )
+
+        record = batch["record"][0]
+        conf = {
+            "id": record.id,
+            "confidence_score": float(
+                ((4 * out["complex_plddt"][0]) + out["iptm"][0]) / 5
+            ),
+            "ptm": float(out["ptm"][0]),
+            "iptm": float(out["iptm"][0]),
+            "ligand_iptm": float(out["ligand_iptm"][0]),
+            "protein_iptm": float(out["protein_iptm"][0]),
+            "complex_plddt": float(out["complex_plddt"][0]),
+            "complex_iplddt": float(out["complex_iplddt"][0]),
+            "complex_pde": float(out["complex_pde"][0]),
+            "complex_ipde": float(out["complex_ipde"][0]),
+        }
+        if "pair_chains_iptm" in out:
+            conf["pair_chains_iptm"] = {
+                str(i): {str(j): float(out["pair_chains_iptm"][i][j][0]) for j in out["pair_chains_iptm"][i]}
+                for i in out["pair_chains_iptm"]
+            }
+
+        if "pae" in out:
+            ipsae = _compute_ipsae(
+                pae=out["pae"][0],
+                asym_id=batch["asym_id"][0],
+                token_mask=batch["token_pad_mask"][0],
+            )
+            conf.update(ipsae)
+
+        full_results.append(conf)
+        summary_results.append(
+            {
+                "id": conf["id"],
+                "confidence_score": conf["confidence_score"],
+                "ptm": conf["ptm"],
+                "iptm": conf["iptm"],
+                "complex_plddt": conf["complex_plddt"],
+                "complex_iplddt": conf["complex_iplddt"],
+                "complex_pde": conf["complex_pde"],
+                "complex_ipde": conf["complex_ipde"],
+                "ipSAE": conf.get("ipSAE", 0.0),
+            }
+        )
+
+    summary_results = sorted(summary_results, key=lambda x: x["confidence_score"], reverse=True)
+    full_results = sorted(full_results, key=lambda x: x["confidence_score"], reverse=True)
+
+    with (out_dir / "summary_confidence.json").open("w") as f:
+        json.dump(summary_results, f, indent=4)
+    with (out_dir / "full_confidence.json").open("w") as f:
+        json.dump(full_results, f, indent=4)
+
+    csv_fields = [
+        "id",
+        "confidence_score",
+        "ptm",
+        "iptm",
+        "complex_plddt",
+        "complex_iplddt",
+        "complex_pde",
+        "complex_ipde",
+        "ipSAE",
+    ]
+    with (out_dir / "summary.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        writer.writerows(summary_results)
+
+    click.echo(f"Scoring complete. Results written to {out_dir}.")
 
 
 @cli.command()
