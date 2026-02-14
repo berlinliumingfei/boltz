@@ -47,6 +47,27 @@ boltz predict input_path --use_msa_server
 
 `input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
 
+### Confidence-only scoring (`boltz score`)
+
+For already-generated structures (`.pdb` / `.cif` / `.mmcif`), you can run confidence scoring without diffusion sampling:
+
+```
+boltz score path/to/structures --out_dir ./scores
+```
+
+Useful options:
+
+- `--checkpoint`: optional Boltz-2 confidence checkpoint (defaults to cached `boltz2_conf.ckpt`)
+- `--accelerator {gpu,cpu}`: choose execution device
+- `--recycling_steps`: confidence/trunk recycling count (default `3`)
+
+The command writes:
+
+- `summary_confidence.json`: compact per-structure summary (sorted by `confidence_score`)
+- `full_confidence.json`: full confidence outputs including pair-chain metrics
+- `summary.csv`: tabular summary for downstream analysis
+
+Outputs include standard confidence fields (`confidence_score`, `ptm`, `iptm`, `complex_plddt`, `complex_iplddt`, `complex_pde`, `complex_ipde`) and an additional interface metric `ipSAE`.
 
 ### Binding Affinity Prediction
 There are two main predictions in the affinity output: `affinity_pred_value` and `affinity_probability_binary`. They are trained on largely different datasets, with different supervisions, and should be used in different contexts. The `affinity_probability_binary` field should be used to detect binders from decoys, for example in a hit-discovery stage. Its value ranges from 0 to 1 and represents the predicted probability that the ligand is a binder. The `affinity_pred_value` aims to measure the specific affinity of different binders and how this changes with small modifications of the molecule. This should be used in ligand optimization stages such as hit-to-lead and lead-optimization. It reports a binding affinity value as `log10(IC50)`, derived from an `IC50` measured in `μM`. More details on how to run affinity predictions and parse the output can be found in our [prediction instructions](docs/prediction.md).
@@ -70,6 +91,54 @@ To encourage reproducibility and facilitate comparison with other models, on top
 ⚠️ **Coming soon: updated training code for Boltz-2!**
 
 If you're interested in retraining the model, currently for Boltz-1 but soon for Boltz-2, see our [training instructions](docs/training.md).
+
+### Standalone diffusion generative model (`DiffusionGenModel`)
+
+For workflows where you already have external conditioning tensors and only want to train/sample the diffusion component, you can use `DiffusionGenModel` directly.
+
+```python
+from boltz.model.models import DiffusionGenModel
+
+model = DiffusionGenModel(
+    model_version="v1",  # or "v2"
+    score_model_args={
+        "token_s": 384,
+        "token_z": 128,
+        "atom_s": 128,
+        "atom_z": 16,
+        "dim_fourier": 256,
+    },
+    diffusion_process_args={
+        "num_sampling_steps": 5,
+        "sigma_min": 0.0004,
+        "sigma_max": 160.0,
+    },
+    diffusion_loss_args={
+        "add_smooth_lddt_loss": True,
+    },
+)
+```
+
+Expected batch keys:
+
+- `v1`: `s_inputs`, `s_trunk`, `z_trunk`, `relative_position_encoding`, `feats`
+- `v2`: `s_inputs`, `s_trunk`, `diffusion_conditioning`, `feats`
+
+Optional keys:
+
+- `multiplicity` (defaults to `1`)
+- `num_sampling_steps` (used by `predict_step`)
+
+Example usage:
+
+```python
+# training
+loss = model.training_step(batch, batch_idx=0)
+
+# sampling / prediction
+pred = model.predict_step(batch, batch_idx=0)
+coords = pred["sample_atom_coords"]
+```
 
 
 ## Contributing
