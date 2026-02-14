@@ -71,6 +71,54 @@ To encourage reproducibility and facilitate comparison with other models, on top
 
 If you're interested in retraining the model, currently for Boltz-1 but soon for Boltz-2, see our [training instructions](docs/training.md).
 
+### Standalone diffusion generative model (`DiffusionGenModel`)
+
+For workflows where you already have external conditioning tensors and only want to train/sample the diffusion component, you can use `DiffusionGenModel` directly.
+
+```python
+from boltz.model.models import DiffusionGenModel
+
+model = DiffusionGenModel(
+    model_version="v1",  # or "v2"
+    score_model_args={
+        "token_s": 384,
+        "token_z": 128,
+        "atom_s": 128,
+        "atom_z": 16,
+        "dim_fourier": 256,
+    },
+    diffusion_process_args={
+        "num_sampling_steps": 5,
+        "sigma_min": 0.0004,
+        "sigma_max": 160.0,
+    },
+    diffusion_loss_args={
+        "add_smooth_lddt_loss": True,
+    },
+)
+```
+
+Expected batch keys:
+
+- `v1`: `s_inputs`, `s_trunk`, `z_trunk`, `relative_position_encoding`, `feats`
+- `v2`: `s_inputs`, `s_trunk`, `diffusion_conditioning`, `feats`
+
+Optional keys:
+
+- `multiplicity` (defaults to `1`)
+- `num_sampling_steps` (used by `predict_step`)
+
+Example usage:
+
+```python
+# training
+loss = model.training_step(batch, batch_idx=0)
+
+# sampling / prediction
+pred = model.predict_step(batch, batch_idx=0)
+coords = pred["sample_atom_coords"]
+```
+
 
 ## Contributing
 
